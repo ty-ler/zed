@@ -30,7 +30,8 @@ use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
     Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
-    ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
+    ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, NewPathPromptOptions, OsMenu,
+    OwnedMenu, PathPromptFilter, PathPromptFilterRule, PathPromptOptions, PathPromptPlatform,
     Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
     WindowParams, popup::PopupNotSupportedError,
@@ -46,7 +47,8 @@ use objc::{
 };
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSModalResponse, NSModalResponseOK, NSOpenPanel, NSSavePanel, NSWorkspace};
-use objc2_foundation::NSActivityOptions;
+use objc2_foundation::{NSActivityOptions, NSArray as NSArray2, NSString as NSString2};
+use objc2_uniform_type_identifiers::UTType;
 use parking_lot::Mutex;
 use ptr::null_mut;
 use semver::Version;
@@ -66,6 +68,132 @@ use std::{
 
 #[allow(non_upper_case_globals)]
 const NSUTF8StringEncoding: NSUInteger = 4;
+
+fn allowed_content_types(
+    filters: &[PathPromptFilter],
+    default_filter: Option<usize>,
+) -> Vec<objc2::rc::Retained<UTType>> {
+    if filters.is_empty() {
+        return Vec::new();
+    }
+
+    let default_filter = default_filter.unwrap_or(0).min(filters.len() - 1);
+    let filter_order = std::iter::once(default_filter)
+        .chain((0..filters.len()).filter(move |index| *index != default_filter));
+    let mut result = Vec::new();
+    let mut identifiers = std::collections::HashSet::new();
+
+    for filter_index in filter_order {
+        for rule in filters[filter_index].rules() {
+            let content_type = match rule {
+                PathPromptFilterRule::Extension(extension) => {
+                    UTType::typeWithFilenameExtension(&NSString2::from_str(extension))
+                }
+                PathPromptFilterRule::MediaType(media_type) => {
+                    let wildcard_identifier = match media_type.as_ref() {
+                        "image/*" => Some("public.image"),
+                        "audio/*" => Some("public.audio"),
+                        "video/*" => Some("public.movie"),
+                        "text/*" => Some("public.text"),
+                        _ => None,
+                    };
+                    wildcard_identifier
+                        .and_then(|identifier| {
+                            UTType::typeWithIdentifier(&NSString2::from_str(identifier))
+                        })
+                        .or_else(|| UTType::typeWithMIMEType(&NSString2::from_str(media_type)))
+                }
+                PathPromptFilterRule::PlatformType {
+                    platform: PathPromptPlatform::MacOS,
+                    identifier,
+                } => UTType::typeWithIdentifier(&NSString2::from_str(identifier)),
+                PathPromptFilterRule::PlatformType { .. } => None,
+            };
+            if let Some(content_type) = content_type {
+                let identifier = content_type.identifier().to_string();
+                if identifiers.insert(identifier) {
+                    result.push(content_type);
+                }
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod path_prompt_filter_tests {
+    use super::*;
+
+    #[test]
+    fn maps_extensions_media_and_macos_identifiers_and_ignores_other_platforms() {
+        let filters = vec![
+            PathPromptFilter::new(
+                "Images",
+                [
+                    PathPromptFilterRule::extension("png").unwrap(),
+                    PathPromptFilterRule::media_type("image/*").unwrap(),
+                ],
+            )
+            .unwrap(),
+            PathPromptFilter::new(
+                "Native",
+                [
+                    PathPromptFilterRule::platform_type(
+                        PathPromptPlatform::MacOS,
+                        "public.plain-text",
+                    )
+                    .unwrap(),
+                    PathPromptFilterRule::platform_type(PathPromptPlatform::Windows, "ignored")
+                        .unwrap(),
+                ],
+            )
+            .unwrap(),
+        ];
+
+        let types = allowed_content_types(&filters, Some(1));
+        let identifiers = types
+            .iter()
+            .map(|content_type| content_type.identifier().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            identifiers
+                .iter()
+                .any(|identifier| identifier == "public.plain-text")
+        );
+        assert!(
+            identifiers
+                .iter()
+                .any(|identifier| identifier == "public.image")
+        );
+        assert!(!identifiers.iter().any(|identifier| identifier == "ignored"));
+    }
+
+    #[test]
+    fn unsupported_rules_fall_back_to_an_empty_native_filter() {
+        let filters = vec![
+            PathPromptFilter::new(
+                "Windows only",
+                [
+                    PathPromptFilterRule::platform_type(PathPromptPlatform::Windows, "native")
+                        .unwrap(),
+                ],
+            )
+            .unwrap(),
+        ];
+        assert!(allowed_content_types(&filters, Some(0)).is_empty());
+    }
+}
+
+fn apply_allowed_content_types(
+    panel: &NSSavePanel,
+    filters: &[PathPromptFilter],
+    default_filter: Option<usize>,
+) {
+    let content_types = allowed_content_types(filters, default_filter);
+    if !content_types.is_empty() {
+        panel.setAllowedContentTypes(&NSArray2::from_retained_slice(&content_types));
+    }
+}
 
 const MAC_PLATFORM_IVAR: &str = "platform";
 static mut APP_CLASS: *const Class = ptr::null();
@@ -798,6 +926,13 @@ impl Platform for MacPlatform {
 
                 panel.setCanCreateDirectories(true);
                 panel.setResolvesAliases(false);
+                if options.files && !options.directories {
+                    apply_allowed_content_types(
+                        &panel,
+                        &options.filters,
+                        options.effective_default_filter(),
+                    );
+                }
 
                 let done_tx = Cell::new(Some(done_tx));
                 let handler = RcBlock::new({
@@ -834,16 +969,26 @@ impl Platform for MacPlatform {
         directory: &Path,
         suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+        self.prompt_for_new_path_with_options(NewPathPromptOptions::new(directory, suggested_name))
+    }
+
+    fn prompt_for_new_path_with_options(
+        &self,
+        options: NewPathPromptOptions,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         use objc2_foundation::{NSString, NSURL};
 
-        let url = NSURL::from_directory_path(directory);
-        let suggested_name = suggested_name.map(NSString::from_str);
+        let url = NSURL::from_directory_path(&options.directory);
+        let suggested_name = options.suggested_name.as_deref().map(NSString::from_str);
+        let default_filter = options.effective_default_filter();
+        let filters = options.filters;
         let (done_tx, done_rx) = oneshot::channel();
         let marker = self.1;
         self.foreground_executor()
             .spawn(async move {
                 let panel = NSSavePanel::savePanel(marker);
                 panel.setDirectoryURL(url.as_deref());
+                apply_allowed_content_types(&panel, &filters, default_filter);
 
                 if let Some(suggested_name) = suggested_name {
                     panel.setNameFieldStringValue(&suggested_name);

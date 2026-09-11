@@ -689,13 +689,18 @@ impl Platform for WindowsPlatform {
         directory: &Path,
         suggested_name: Option<&str>,
     ) -> Receiver<Result<Option<PathBuf>>> {
-        let directory = directory.to_owned();
-        let suggested_name = suggested_name.map(|s| s.to_owned());
+        self.prompt_for_new_path_with_options(NewPathPromptOptions::new(directory, suggested_name))
+    }
+
+    fn prompt_for_new_path_with_options(
+        &self,
+        options: NewPathPromptOptions,
+    ) -> Receiver<Result<Option<PathBuf>>> {
         let (tx, rx) = oneshot::channel();
         let window = self.find_current_active_window();
         self.foreground_executor()
             .spawn(async move {
-                let _ = tx.send(file_save_dialog(directory, suggested_name, window));
+                let _ = tx.send(file_save_dialog(options, window));
             })
             .detach();
 
@@ -1382,6 +1387,16 @@ fn file_open_dialog(
     unsafe {
         folder_dialog.SetOptions(dialog_options)?;
 
+        let native_filters = (!options.directories)
+            .then(|| WindowsFileFilters::new(&options.filters, options.effective_default_filter()));
+        if let Some(native_filters) = native_filters
+            .as_ref()
+            .filter(|filters| !filters.specs.is_empty())
+        {
+            folder_dialog.SetFileTypes(&native_filters.specs)?;
+            folder_dialog.SetFileTypeIndex(native_filters.default_index)?;
+        }
+
         if let Some(prompt) = options.prompt {
             let prompt: &str = &prompt;
             folder_dialog.SetOkButtonLabel(&HSTRING::from(prompt))?;
@@ -1410,13 +1425,13 @@ fn file_open_dialog(
 }
 
 fn file_save_dialog(
-    directory: PathBuf,
-    suggested_name: Option<String>,
+    options: NewPathPromptOptions,
     window: Option<HWND>,
 ) -> Result<Option<PathBuf>> {
     let dialog: IFileSaveDialog = unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)? };
-    if !directory.to_string_lossy().is_empty()
-        && let Some(full_path) = directory
+    if !options.directory.to_string_lossy().is_empty()
+        && let Some(full_path) = options
+            .directory
             .canonicalize()
             .context("failed to canonicalize directory")
             .log_err()
@@ -1433,7 +1448,7 @@ fn file_save_dialog(
         };
     }
 
-    if let Some(suggested_name) = suggested_name {
+    if let Some(suggested_name) = options.suggested_name.as_deref() {
         unsafe {
             dialog
                 .SetFileName(&HSTRING::from(suggested_name))
@@ -1443,10 +1458,17 @@ fn file_save_dialog(
     }
 
     unsafe {
-        dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
-            pszName: windows::core::w!("All files"),
-            pszSpec: windows::core::w!("*.*"),
-        }])?;
+        let native_filters =
+            WindowsFileFilters::new(&options.filters, options.effective_default_filter());
+        if native_filters.specs.is_empty() {
+            dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
+                pszName: windows::core::w!("All files"),
+                pszSpec: windows::core::w!("*.*"),
+            }])?;
+        } else {
+            dialog.SetFileTypes(&native_filters.specs)?;
+            dialog.SetFileTypeIndex(native_filters.default_index)?;
+        }
         if dialog.Show(window).is_err() {
             // User cancelled
             return Ok(None);
@@ -1460,6 +1482,63 @@ fn file_save_dialog(
         string
     };
     Ok(Some(PathBuf::from(file_path_string)))
+}
+
+struct WindowsFileFilters {
+    _labels: Vec<HSTRING>,
+    _patterns: Vec<HSTRING>,
+    specs: Vec<Common::COMDLG_FILTERSPEC>,
+    default_index: u32,
+}
+
+impl WindowsFileFilters {
+    fn new(filters: &[PathPromptFilter], default_filter: Option<usize>) -> Self {
+        let mapped = filters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, filter)| {
+                let pattern = filter
+                    .rules()
+                    .iter()
+                    .filter_map(|rule| match rule {
+                        PathPromptFilterRule::Extension(extension) => {
+                            Some(format!("*.{extension}"))
+                        }
+                        _ => None,
+                    })
+                    .join(";");
+                (!pattern.is_empty()).then(|| (index, filter.label().to_string(), pattern))
+            })
+            .collect::<Vec<_>>();
+        let selected_original = default_filter.unwrap_or(0);
+        let default_index = mapped
+            .iter()
+            .position(|(index, _, _)| *index == selected_original)
+            .unwrap_or(0) as u32
+            + 1;
+        let labels = mapped
+            .iter()
+            .map(|(_, label, _)| HSTRING::from(label))
+            .collect::<Vec<_>>();
+        let patterns = mapped
+            .iter()
+            .map(|(_, _, pattern)| HSTRING::from(pattern))
+            .collect::<Vec<_>>();
+        let specs = labels
+            .iter()
+            .zip(&patterns)
+            .map(|(label, pattern)| Common::COMDLG_FILTERSPEC {
+                pszName: PCWSTR(label.as_ptr()),
+                pszSpec: PCWSTR(pattern.as_ptr()),
+            })
+            .collect();
+        Self {
+            _labels: labels,
+            _patterns: patterns,
+            specs,
+            default_index,
+        }
+    }
 }
 
 fn load_icon() -> Result<HICON> {
@@ -1628,9 +1707,36 @@ mod tests {
     use std::ffi::{OsStr, OsString};
 
     use crate::{read_from_clipboard, write_to_clipboard};
-    use gpui::ClipboardItem;
+    use gpui::{ClipboardItem, PathPromptFilter, PathPromptFilterRule, PathPromptPlatform};
 
-    use super::encode_restart_arguments;
+    use super::{WindowsFileFilters, encode_restart_arguments};
+
+    #[test]
+    fn path_filters_map_extension_groups_and_ignore_unsupported_rules() {
+        let filters = vec![
+            PathPromptFilter::new(
+                "Images",
+                [
+                    PathPromptFilterRule::extension("png").unwrap(),
+                    PathPromptFilterRule::extension("jpg").unwrap(),
+                    PathPromptFilterRule::media_type("image/*").unwrap(),
+                ],
+            )
+            .unwrap(),
+            PathPromptFilter::new(
+                "Linux only",
+                [
+                    PathPromptFilterRule::platform_type(PathPromptPlatform::Linux, "ignored")
+                        .unwrap(),
+                ],
+            )
+            .unwrap(),
+        ];
+        let native = WindowsFileFilters::new(&filters, Some(1));
+        assert_eq!(native.specs.len(), 1);
+        assert_eq!(native.default_index, 1);
+        assert_eq!(native._patterns[0].to_string_lossy(), "*.png;*.jpg");
+    }
 
     #[test]
     fn test_encode_restart_arguments() {

@@ -1183,8 +1183,8 @@ impl AnyWindowHandle {
 #[cfg(test)]
 mod tests {
     use crate::{
-        PathPromptOptions, SystemNotification, SystemNotificationAction,
-        SystemNotificationResponse, TestAppContext,
+        PathPromptFilter, PathPromptFilterRule, PathPromptOptions, SystemNotification,
+        SystemNotificationAction, SystemNotificationResponse, TestAppContext,
     };
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -1340,6 +1340,14 @@ mod tests {
                 directories: true,
                 multiple: true,
                 prompt: None,
+                filters: vec![
+                    PathPromptFilter::new(
+                        "Images",
+                        [PathPromptFilterRule::extension(".PNG").unwrap()],
+                    )
+                    .unwrap(),
+                ],
+                default_filter: Some(0),
             })
         });
         assert!(cx.did_prompt_for_paths());
@@ -1349,6 +1357,8 @@ mod tests {
             let selected = selected.clone();
             move |options| {
                 assert!(options.multiple);
+                assert_eq!(options.filters[0].label(), "Images");
+                assert_eq!(options.effective_default_filter(), Some(0));
                 Some(selected)
             }
         });
@@ -1366,6 +1376,7 @@ mod tests {
                 directories: false,
                 multiple: false,
                 prompt: None,
+                ..Default::default()
             })
         });
 

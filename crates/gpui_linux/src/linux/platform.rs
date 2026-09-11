@@ -33,11 +33,13 @@ use xkbcommon::xkb::{self, Keycode, Keysym, State};
 use crate::linux::{LinuxDispatcher, PriorityQueueCalloopReceiver};
 use gpui::{
     Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
-    DisplayId, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
-    WindowButtonLayout, WindowParams,
+    DisplayId, ForegroundExecutor, Keymap, Menu, MenuItem, NewPathPromptOptions, OwnedMenu,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, Result, RunnableVariant, Task, ThermalState,
+    WindowAppearance, WindowButtonLayout, WindowParams,
 };
+#[cfg(any(feature = "wayland", feature = "x11"))]
+use gpui::{PathPromptFilter, PathPromptFilterRule};
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use gpui::{Pixels, Point, px};
 
@@ -55,6 +57,50 @@ pub(crate) const KEYRING_LABEL: &str = "zed-github-account";
 #[cfg(any(feature = "wayland", feature = "x11"))]
 const FILE_PICKER_PORTAL_MISSING: &str =
     "Couldn't open file picker due to missing xdg-desktop-portal implementation.";
+
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn portal_file_filters(
+    filters: &[PathPromptFilter],
+    default_filter: Option<usize>,
+) -> (
+    Vec<ashpd::desktop::file_chooser::FileFilter>,
+    Option<ashpd::desktop::file_chooser::FileFilter>,
+) {
+    use ashpd::desktop::file_chooser::FileFilter;
+
+    let mapped = filters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, filter)| {
+            let mut native = FileFilter::new(filter.label());
+            let mut has_rule = false;
+            for rule in filter.rules() {
+                match rule {
+                    PathPromptFilterRule::Extension(extension) => {
+                        native = native.glob(&format!("*.{extension}"));
+                        has_rule = true;
+                    }
+                    PathPromptFilterRule::MediaType(media_type) => {
+                        native = native.mimetype(media_type);
+                        has_rule = true;
+                    }
+                    PathPromptFilterRule::PlatformType { .. } => {}
+                }
+            }
+            has_rule.then_some((index, native))
+        })
+        .collect::<Vec<_>>();
+    let selected = default_filter.unwrap_or(0);
+    let current = mapped
+        .iter()
+        .find(|(index, _)| *index == selected)
+        .or_else(|| mapped.first())
+        .map(|(_, filter)| filter.clone());
+    (
+        mapped.into_iter().map(|(_, filter)| filter).collect(),
+        current,
+    )
+}
 
 pub(crate) trait LinuxClient {
     fn compositor_name(&self) -> &'static str;
@@ -454,16 +500,23 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                     "Open File"
                 };
 
-                let request = match ashpd::desktop::file_chooser::OpenFileRequest::default()
+                let mut request_builder = ashpd::desktop::file_chooser::OpenFileRequest::default()
                     .identifier(identifier.await)
                     .modal(true)
                     .title(title)
                     .accept_label(options.prompt.as_ref().map(gpui::SharedString::as_str))
                     .multiple(options.multiple)
-                    .directory(options.directories)
-                    .send()
-                    .await
-                {
+                    .directory(options.directories);
+                if !options.directories {
+                    let (filters, current_filter) =
+                        portal_file_filters(&options.filters, options.effective_default_filter());
+                    if !filters.is_empty() {
+                        request_builder = request_builder
+                            .filters(filters)
+                            .current_filter(current_filter);
+                    }
+                }
+                let request = match request_builder.send().await {
                     Ok(request) => request,
                     Err(err) => {
                         let result = match err {
@@ -498,10 +551,17 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         directory: &Path,
         suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+        self.prompt_for_new_path_with_options(NewPathPromptOptions::new(directory, suggested_name))
+    }
+
+    fn prompt_for_new_path_with_options(
+        &self,
+        options: NewPathPromptOptions,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (done_tx, done_rx) = oneshot::channel();
 
         #[cfg(not(any(feature = "wayland", feature = "x11")))]
-        let _ = (done_tx.send(Ok(None)), directory, suggested_name);
+        let _ = (done_tx.send(Ok(None)), options);
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
         let identifier = self.inner.window_identifier();
@@ -509,20 +569,25 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         #[cfg(any(feature = "wayland", feature = "x11"))]
         self.foreground_executor()
             .spawn({
-                let directory = directory.to_owned();
-                let suggested_name = suggested_name.map(|s| s.to_owned());
-
                 async move {
+                    let default_filter = options.effective_default_filter();
                     let mut request_builder =
                         ashpd::desktop::file_chooser::SaveFileRequest::default()
                             .identifier(identifier.await)
                             .modal(true)
                             .title("Save File")
-                            .current_folder(directory)
+                            .current_folder(&options.directory)
                             .expect("pathbuf should not be nul terminated");
 
-                    if let Some(suggested_name) = suggested_name {
-                        request_builder = request_builder.current_name(suggested_name.as_str());
+                    if let Some(suggested_name) = options.suggested_name.as_deref() {
+                        request_builder = request_builder.current_name(suggested_name);
+                    }
+                    let (filters, current_filter) =
+                        portal_file_filters(&options.filters, default_filter);
+                    if !filters.is_empty() {
+                        request_builder = request_builder
+                            .filters(filters)
+                            .current_filter(current_filter);
                     }
 
                     let request = match request_builder.send().await {
@@ -1346,7 +1411,38 @@ async fn await_idle_sleep_prevention(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Point, px};
+    use gpui::{PathPromptFilter, PathPromptFilterRule, PathPromptPlatform, Point, px};
+
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    #[test]
+    fn portal_filters_map_extensions_and_media_and_ignore_native_identifiers() {
+        let filters = vec![
+            PathPromptFilter::new(
+                "Images",
+                [
+                    PathPromptFilterRule::extension("png").unwrap(),
+                    PathPromptFilterRule::media_type("image/*").unwrap(),
+                ],
+            )
+            .unwrap(),
+            PathPromptFilter::new(
+                "macOS only",
+                [
+                    PathPromptFilterRule::platform_type(PathPromptPlatform::MacOS, "public.image")
+                        .unwrap(),
+                ],
+            )
+            .unwrap(),
+        ];
+        let (native, current) = portal_file_filters(&filters, Some(1));
+        assert_eq!(native.len(), 1);
+        assert_eq!(
+            current.as_ref().map(|filter| filter.label()),
+            Some("Images")
+        );
+        assert_eq!(native[0].pattern_filters(), ["*.png"]);
+        assert_eq!(native[0].mimetype_filters(), ["image/*"]);
+    }
 
     #[cfg(any(feature = "wayland", feature = "x11"))]
     #[test]

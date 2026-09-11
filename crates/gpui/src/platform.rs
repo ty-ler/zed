@@ -215,6 +215,16 @@ pub trait Platform: 'static {
         directory: &Path,
         suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>>;
+    /// Displays a save prompt using typed options.
+    ///
+    /// The default implementation preserves compatibility for platforms that do not yet
+    /// support file filters by forwarding to [`Platform::prompt_for_new_path`].
+    fn prompt_for_new_path_with_options(
+        &self,
+        options: NewPathPromptOptions,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+        self.prompt_for_new_path(&options.directory, options.suggested_name.as_deref())
+    }
     fn can_select_mixed_files_and_dirs(&self) -> bool;
     fn reveal_path(&self, path: &Path);
     fn open_with_system(&self, path: &Path);
@@ -2303,8 +2313,182 @@ pub enum TextRenderingMode {
     Grayscale,
 }
 
-/// The options that can be configured for a file dialog prompt
-#[derive(Clone, Debug)]
+/// Identifies a platform whose native file type identifier may be used by a filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PathPromptPlatform {
+    /// A Uniform Type Identifier (UTType/UTI) understood by macOS.
+    MacOS,
+    /// A native identifier understood by Windows.
+    Windows,
+    /// A native identifier understood by Linux or its desktop portal.
+    Linux,
+}
+
+/// One normalized rule in a native file dialog filter.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PathPromptFilterRule {
+    /// A filename extension without a leading dot, normalized to lowercase.
+    Extension(SharedString),
+    /// An RFC-style media type, normalized to lowercase. Wildcard subtypes are accepted.
+    MediaType(SharedString),
+    /// A platform-native identifier. Other platforms gracefully ignore this rule.
+    PlatformType {
+        /// The platform that understands the identifier.
+        platform: PathPromptPlatform,
+        /// The trimmed native identifier.
+        identifier: SharedString,
+    },
+}
+
+/// An invalid path prompt filter or rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathPromptFilterError {
+    /// A filter label was empty after trimming.
+    EmptyLabel,
+    /// A filter contained no rules after normalization.
+    EmptyFilter,
+    /// A filename extension was empty or contained unsupported characters.
+    InvalidExtension(SharedString),
+    /// A media type was not in `type/subtype` form.
+    InvalidMediaType(SharedString),
+    /// A platform-native identifier was empty after trimming.
+    EmptyPlatformType,
+}
+
+impl fmt::Display for PathPromptFilterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyLabel => write!(f, "file filter label cannot be empty"),
+            Self::EmptyFilter => write!(f, "file filter must contain at least one rule"),
+            Self::InvalidExtension(extension) => {
+                write!(f, "invalid file extension {extension:?}")
+            }
+            Self::InvalidMediaType(media_type) => {
+                write!(f, "invalid media type {media_type:?}")
+            }
+            Self::EmptyPlatformType => write!(f, "platform file type identifier cannot be empty"),
+        }
+    }
+}
+
+impl std::error::Error for PathPromptFilterError {}
+
+impl PathPromptFilterRule {
+    /// Creates and normalizes an extension rule.
+    pub fn extension(extension: impl Into<SharedString>) -> Result<Self, PathPromptFilterError> {
+        let original = extension.into();
+        let normalized = original.trim().trim_start_matches('.').to_ascii_lowercase();
+        if normalized.is_empty()
+            || normalized
+                .chars()
+                .any(|character| character.is_whitespace() || "/\\*?[]".contains(character))
+        {
+            return Err(PathPromptFilterError::InvalidExtension(original));
+        }
+        Ok(Self::Extension(normalized.into()))
+    }
+
+    /// Creates and normalizes a media type rule such as `image/png` or `image/*`.
+    pub fn media_type(media_type: impl Into<SharedString>) -> Result<Self, PathPromptFilterError> {
+        let original = media_type.into();
+        let normalized = original.trim().to_ascii_lowercase();
+        let Some((type_, subtype)) = normalized.split_once('/') else {
+            return Err(PathPromptFilterError::InvalidMediaType(original));
+        };
+        let valid_token = |value: &str| {
+            !value.is_empty()
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "!#$&^_.+-".contains(character)
+                })
+        };
+        if !valid_token(type_)
+            || !(subtype == "*" || valid_token(subtype))
+            || normalized.matches('/').count() != 1
+        {
+            return Err(PathPromptFilterError::InvalidMediaType(original));
+        }
+        Ok(Self::MediaType(normalized.into()))
+    }
+
+    /// Creates a platform-native file type rule.
+    pub fn platform_type(
+        platform: PathPromptPlatform,
+        identifier: impl Into<SharedString>,
+    ) -> Result<Self, PathPromptFilterError> {
+        let identifier = identifier.into();
+        let identifier = identifier.trim();
+        if identifier.is_empty() {
+            return Err(PathPromptFilterError::EmptyPlatformType);
+        }
+        Ok(Self::PlatformType {
+            platform,
+            identifier: identifier.to_owned().into(),
+        })
+    }
+}
+
+/// A labeled, normalized group of rules shown by a native file dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathPromptFilter {
+    label: SharedString,
+    rules: Vec<PathPromptFilterRule>,
+}
+
+impl PathPromptFilter {
+    /// Creates a filter, trimming its label and removing duplicate normalized rules.
+    pub fn new(
+        label: impl Into<SharedString>,
+        rules: impl IntoIterator<Item = PathPromptFilterRule>,
+    ) -> Result<Self, PathPromptFilterError> {
+        let label = label.into();
+        let label = label.trim();
+        if label.is_empty() {
+            return Err(PathPromptFilterError::EmptyLabel);
+        }
+        let mut normalized_rules = Vec::new();
+        for rule in rules {
+            let rule = match rule {
+                PathPromptFilterRule::Extension(extension) => {
+                    PathPromptFilterRule::extension(extension)?
+                }
+                PathPromptFilterRule::MediaType(media_type) => {
+                    PathPromptFilterRule::media_type(media_type)?
+                }
+                PathPromptFilterRule::PlatformType {
+                    platform,
+                    identifier,
+                } => PathPromptFilterRule::platform_type(platform, identifier)?,
+            };
+            if !normalized_rules.contains(&rule) {
+                normalized_rules.push(rule);
+            }
+        }
+        if normalized_rules.is_empty() {
+            return Err(PathPromptFilterError::EmptyFilter);
+        }
+        Ok(Self {
+            label: label.to_owned().into(),
+            rules: normalized_rules,
+        })
+    }
+
+    /// Returns the user-visible label for this group.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Returns the normalized rules in authored order.
+    pub fn rules(&self) -> &[PathPromptFilterRule] {
+        &self.rules
+    }
+}
+
+/// The options that can be configured for a file dialog prompt.
+///
+/// File filters are ignored for directory-only prompts. Backends omit rules they cannot
+/// represent and show an unfiltered dialog if no rule can be represented. Windows and Linux
+/// expose multiple groups; macOS applies their union, with the default group ordered first.
+#[derive(Clone, Debug, Default)]
 pub struct PathPromptOptions {
     /// Should the prompt allow files to be selected?
     pub files: bool,
@@ -2314,6 +2498,57 @@ pub struct PathPromptOptions {
     pub multiple: bool,
     /// The prompt to show to a user when selecting a path
     pub prompt: Option<SharedString>,
+    /// Labeled file-type filter groups.
+    pub filters: Vec<PathPromptFilter>,
+    /// The zero-based initially selected filter. Invalid indices deterministically select zero.
+    pub default_filter: Option<usize>,
+}
+
+impl PathPromptOptions {
+    /// Returns the valid default filter index, falling back to the first filter.
+    pub fn effective_default_filter(&self) -> Option<usize> {
+        (!self.filters.is_empty()).then(|| {
+            self.default_filter
+                .filter(|index| *index < self.filters.len())
+                .unwrap_or(0)
+        })
+    }
+}
+
+/// Options for a file dialog that selects a new path to save.
+#[derive(Clone, Debug, Default)]
+pub struct NewPathPromptOptions {
+    /// The initial directory.
+    pub directory: PathBuf,
+    /// The initially suggested filename.
+    pub suggested_name: Option<SharedString>,
+    /// Labeled file-type filter groups.
+    pub filters: Vec<PathPromptFilter>,
+    /// The zero-based initially selected filter. Invalid indices deterministically select zero.
+    pub default_filter: Option<usize>,
+}
+
+impl NewPathPromptOptions {
+    /// Creates options equivalent to the existing unfiltered save prompt API.
+    pub fn new(
+        directory: impl Into<PathBuf>,
+        suggested_name: Option<impl Into<SharedString>>,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            suggested_name: suggested_name.map(Into::into),
+            ..Self::default()
+        }
+    }
+
+    /// Returns the valid default filter index, falling back to the first filter.
+    pub fn effective_default_filter(&self) -> Option<usize> {
+        (!self.filters.is_empty()).then(|| {
+            self.default_filter
+                .filter(|index| *index < self.filters.len())
+                .unwrap_or(0)
+        })
+    }
 }
 
 /// What kind of prompt styling to show
@@ -2976,6 +3211,70 @@ mod image_tests {
         for pixel in bytes.chunks_exact(4) {
             assert_eq!(pixel, &[0xF8, 0xBD, 0x38, 0xFF]);
         }
+    }
+}
+
+#[cfg(test)]
+mod path_prompt_filter_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_extensions_media_types_and_duplicates() {
+        let extension = PathPromptFilterRule::extension(" .PNG ").unwrap();
+        let media_type = PathPromptFilterRule::media_type(" IMAGE/* ").unwrap();
+        let filter =
+            PathPromptFilter::new(" Images ", [extension.clone(), media_type, extension]).unwrap();
+
+        assert_eq!(filter.label(), "Images");
+        assert_eq!(
+            filter.rules(),
+            vec![
+                PathPromptFilterRule::Extension("png".into()),
+                PathPromptFilterRule::MediaType("image/*".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_filter_input() {
+        assert!(matches!(
+            PathPromptFilterRule::extension(".*"),
+            Err(PathPromptFilterError::InvalidExtension(_))
+        ));
+        assert!(matches!(
+            PathPromptFilterRule::media_type("image"),
+            Err(PathPromptFilterError::InvalidMediaType(_))
+        ));
+        assert!(matches!(
+            PathPromptFilterRule::media_type("*/png"),
+            Err(PathPromptFilterError::InvalidMediaType(_))
+        ));
+        assert!(matches!(
+            PathPromptFilter::new(" ", [PathPromptFilterRule::extension("txt").unwrap()]),
+            Err(PathPromptFilterError::EmptyLabel)
+        ));
+        assert!(matches!(
+            PathPromptFilter::new("Empty", []),
+            Err(PathPromptFilterError::EmptyFilter)
+        ));
+    }
+
+    #[test]
+    fn default_filter_is_deterministic() {
+        let filter = || {
+            PathPromptFilter::new("Text", [PathPromptFilterRule::extension("txt").unwrap()])
+                .unwrap()
+        };
+        let options = PathPromptOptions {
+            filters: vec![filter(), filter()],
+            default_filter: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(options.effective_default_filter(), Some(0));
+        assert_eq!(
+            PathPromptOptions::default().effective_default_filter(),
+            None
+        );
     }
 }
 
