@@ -1085,6 +1085,7 @@ fn register_actions(
                     directories: true,
                     multiple: true,
                     prompt: None,
+                    ..Default::default()
                 },
                 action.create_new_window.unwrap_or_else(|| {
                     matches!(
@@ -1106,6 +1107,7 @@ fn register_actions(
                     directories,
                     multiple: true,
                     prompt: None,
+                    ..Default::default()
                 },
                 true,
                 window,
@@ -1134,6 +1136,7 @@ fn register_actions(
                     directories: true,
                     multiple: true,
                     prompt: None,
+                    ..Default::default()
                 },
                 DirectoryLister::Project(workspace.project().clone()),
                 window,

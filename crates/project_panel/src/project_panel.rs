@@ -3683,6 +3683,7 @@ impl ProjectPanel {
             directories: true,
             multiple: false,
             prompt: Some("Download".into()),
+            ..Default::default()
         });
 
         let fs = self.fs.clone();
