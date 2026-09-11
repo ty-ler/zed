@@ -623,6 +623,42 @@ impl A11yNodeBuilder {
                     .collect();
                 node.set_children(valid);
             }
+
+            macro_rules! repair_relation {
+                ($getter:ident, $setter:ident, $name:literal) => {{
+                    let targets = node.$getter();
+                    if targets
+                        .iter()
+                        .any(|target| target == id || !node_ids.contains(target))
+                    {
+                        let valid = targets
+                            .iter()
+                            .copied()
+                            .filter(|target| target != id && node_ids.contains(target))
+                            .collect::<Vec<_>>();
+                        log::error!(
+                            "a11y: Node {:?} has invalid {} relationships; stripping them",
+                            id,
+                            $name
+                        );
+                        node.$setter(valid);
+                    }
+                }};
+            }
+
+            repair_relation!(controls, set_controls, "controls");
+            repair_relation!(labelled_by, set_labelled_by, "labelled-by");
+            repair_relation!(described_by, set_described_by, "described-by");
+
+            if let Some(target) = node.error_message()
+                && (target == *id || !node_ids.contains(&target))
+            {
+                log::error!(
+                    "a11y: Node {:?} has an invalid error-message relationship; stripping it",
+                    id
+                );
+                node.clear_error_message();
+            }
         }
 
         update
@@ -673,6 +709,35 @@ mod tests {
         builder.pop(); // container
         let update = builder.finalize();
         assert_eq!(update.focus, item);
+    }
+
+    #[test]
+    fn invalid_relationship_targets_are_removed_from_tree_updates() {
+        let mut builder = new_builder();
+        let source = NodeId(1);
+        let target = NodeId(2);
+        let missing = NodeId(999);
+        let mut source_node = test_node();
+        source_node.set_controls(vec![target, source, missing]);
+        source_node.set_labelled_by(vec![target, missing]);
+        source_node.set_described_by(vec![missing]);
+        source_node.set_error_message(missing);
+
+        assert!(builder.push(source, source_node));
+        builder.pop();
+        assert!(builder.push(target, test_node()));
+        builder.pop();
+
+        let update = builder.finalize();
+        let source_node = update
+            .nodes
+            .iter()
+            .find_map(|(id, node)| (*id == source).then_some(node))
+            .unwrap();
+        assert_eq!(source_node.controls(), &[target]);
+        assert_eq!(source_node.labelled_by(), &[target]);
+        assert!(source_node.described_by().is_empty());
+        assert_eq!(source_node.error_message(), None);
     }
 
     #[test]

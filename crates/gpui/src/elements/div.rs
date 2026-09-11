@@ -1325,6 +1325,21 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Override the internal AccessKit node ID for this element.
+    ///
+    /// Use a stable, nonzero ID unique within the window accessibility tree.
+    /// This keeps identity and relationships stable when popup content moves
+    /// between the ordinary tree and a deferred overlay.
+    fn accessibility_node_id(mut self, id: accesskit::NodeId) -> Self {
+        assert_ne!(
+            id,
+            accesskit::NodeId(0),
+            "AccessKit node ID 0 is reserved for the window root"
+        );
+        self.interactivity().aria.node_id = Some(id);
+        self
+    }
+
     /// Set the accessible label for this element.
     fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.interactivity().aria.label = Some(label.into());
@@ -1396,6 +1411,96 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// Set the expanded state for this element.
     fn aria_expanded(mut self, expanded: bool) -> Self {
         self.interactivity().aria.expanded = Some(expanded);
+        self
+    }
+
+    /// Set the kind of popup exposed by this control.
+    fn aria_has_popup(mut self, popup: accesskit::HasPopup) -> Self {
+        self.interactivity().aria.has_popup = Some(popup);
+        self
+    }
+
+    /// Mark this element as modal or non-modal.
+    fn aria_modal(mut self, modal: bool) -> Self {
+        self.interactivity().aria.modal = Some(modal);
+        self
+    }
+
+    /// Identify nodes controlled by this element.
+    ///
+    /// AccessKit adapters derive the reverse controlled-by relationship from
+    /// this native `controls` relation.
+    fn aria_controls(mut self, targets: impl IntoIterator<Item = accesskit::NodeId>) -> Self {
+        self.interactivity().aria.controls = Some(valid_relationship_targets(targets));
+        self
+    }
+
+    /// Identify nodes that label this element.
+    fn aria_labelled_by(mut self, targets: impl IntoIterator<Item = accesskit::NodeId>) -> Self {
+        self.interactivity().aria.labelled_by = Some(valid_relationship_targets(targets));
+        self
+    }
+
+    /// Identify nodes that describe this element.
+    fn aria_described_by(mut self, targets: impl IntoIterator<Item = accesskit::NodeId>) -> Self {
+        self.interactivity().aria.described_by = Some(valid_relationship_targets(targets));
+        self
+    }
+
+    /// Mark whether a collection permits multiple selected descendants.
+    fn aria_multiselectable(mut self, multiselectable: bool) -> Self {
+        self.interactivity().aria.multiselectable = Some(multiselectable);
+        self
+    }
+
+    /// Set live-region politeness.
+    ///
+    /// AccessKit derives relevant changes from node label, value, and child
+    /// diffs. It does not expose ARIA's author-set `relevant` filter, so each
+    /// adapter uses its platform default for that unsupported distinction.
+    fn aria_live(mut self, live: accesskit::Live) -> Self {
+        self.interactivity().aria.live = Some(live);
+        self
+    }
+
+    /// Mark whether a live-region update should be announced atomically.
+    fn aria_live_atomic(mut self, atomic: bool) -> Self {
+        self.interactivity().aria.live_atomic = Some(atomic);
+        self
+    }
+
+    /// Mark whether this element is required by its containing form.
+    fn aria_required(mut self, required: bool) -> Self {
+        self.interactivity().aria.required = Some(required);
+        self
+    }
+
+    /// Set this element's validation state.
+    fn aria_invalid(mut self, invalid: accesskit::Invalid) -> Self {
+        self.interactivity().aria.invalid = Some(invalid);
+        self
+    }
+
+    /// Identify the node containing this element's validation error message.
+    fn aria_error_message(mut self, target: accesskit::NodeId) -> Self {
+        assert_ne!(
+            target,
+            accesskit::NodeId(0),
+            "the window root cannot be an error message"
+        );
+        self.interactivity().aria.error_message = Some(target);
+        self
+    }
+
+    /// Mark whether updates to this element are in progress.
+    fn aria_busy(mut self, busy: bool) -> Self {
+        self.interactivity().aria.busy = Some(busy);
+        self
+    }
+
+    /// Set the current item state within a related collection.
+    fn aria_current(mut self, current: accesskit::AriaCurrent) -> Self {
+        self.interactivity().aria.current = Some(current);
         self
     }
 
@@ -1909,6 +2014,10 @@ impl Element for Div {
         self.interactivity.write_a11y_info(node);
     }
 
+    fn a11y_node_id(&self, global_id: &GlobalElementId) -> accesskit::NodeId {
+        self.interactivity.a11y_node_id(global_id)
+    }
+
     fn a11y_synthetic_children(
         &mut self,
         _prepaint: &mut Self::PrepaintState,
@@ -2099,12 +2208,26 @@ impl IntoElement for Div {
 
 #[derive(Default)]
 pub(crate) struct AriaProperties {
+    pub(crate) node_id: Option<accesskit::NodeId>,
     pub(crate) author_id: Option<SharedString>,
     pub(crate) label: Option<SharedString>,
     pub(crate) description: Option<SharedString>,
     pub(crate) keyshortcuts: Option<SharedString>,
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
+    pub(crate) has_popup: Option<accesskit::HasPopup>,
+    pub(crate) modal: Option<bool>,
+    pub(crate) controls: Option<Vec<accesskit::NodeId>>,
+    pub(crate) labelled_by: Option<Vec<accesskit::NodeId>>,
+    pub(crate) described_by: Option<Vec<accesskit::NodeId>>,
+    pub(crate) multiselectable: Option<bool>,
+    pub(crate) live: Option<accesskit::Live>,
+    pub(crate) live_atomic: Option<bool>,
+    pub(crate) required: Option<bool>,
+    pub(crate) invalid: Option<accesskit::Invalid>,
+    pub(crate) error_message: Option<accesskit::NodeId>,
+    pub(crate) busy: Option<bool>,
+    pub(crate) current: Option<accesskit::AriaCurrent>,
     pub(crate) toggled: Option<accesskit::Toggled>,
     pub(crate) numeric_value: Option<f64>,
     pub(crate) min_numeric_value: Option<f64>,
@@ -2120,6 +2243,23 @@ pub(crate) struct AriaProperties {
     pub(crate) column_index: Option<usize>,
     pub(crate) row_count: Option<usize>,
     pub(crate) column_count: Option<usize>,
+}
+
+fn valid_relationship_targets(
+    targets: impl IntoIterator<Item = accesskit::NodeId>,
+) -> Vec<accesskit::NodeId> {
+    let mut unique = Vec::new();
+    for target in targets {
+        assert_ne!(
+            target,
+            accesskit::NodeId(0),
+            "the window root cannot be an accessibility relationship target"
+        );
+        if !unique.contains(&target) {
+            unique.push(target);
+        }
+    }
+    unique
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -2323,7 +2463,7 @@ impl Interactivity {
 
             if window.a11y.is_active() {
                 if let Some(global_id) = global_id {
-                    let node_id = global_id.accesskit_node_id();
+                    let node_id = self.a11y_node_id(global_id);
                     window.a11y.set_focusable(node_id, focus_handle.id);
                     if focus_handle.is_focused(window) {
                         window.a11y.set_focus(node_id);
@@ -2343,7 +2483,7 @@ impl Interactivity {
             if let Some(global_id) = global_id {
                 window
                     .a11y
-                    .set_active_descendant(global_id.accesskit_node_id());
+                    .set_active_descendant(self.a11y_node_id(global_id));
             }
         }
         window.with_optional_element_state::<InteractiveElementState, _>(
@@ -2596,7 +2736,7 @@ impl Interactivity {
                                         if window.a11y.is_active() {
                                             if let Some(global_id) = global_id {
                                                 if !self.a11y_action_listeners.is_empty() {
-                                                    let node_id = global_id.accesskit_node_id();
+                                                    let node_id = self.a11y_node_id(global_id);
                                                     for (action, listener) in
                                                         self.a11y_action_listeners.drain(..)
                                                     {
@@ -3523,6 +3663,12 @@ impl Interactivity {
         style
     }
 
+    fn a11y_node_id(&self, global_id: &GlobalElementId) -> accesskit::NodeId {
+        self.aria
+            .node_id
+            .unwrap_or_else(|| global_id.accesskit_node_id())
+    }
+
     pub(crate) fn write_a11y_info(&self, node: &mut accesskit::Node) {
         if let Some(id) = &self.aria.author_id {
             node.set_author_id(id.to_string());
@@ -3541,6 +3687,55 @@ impl Interactivity {
         }
         if let Some(expanded) = self.aria.expanded {
             node.set_expanded(expanded);
+        }
+        if let Some(has_popup) = self.aria.has_popup {
+            node.set_has_popup(has_popup);
+        }
+        if let Some(modal) = self.aria.modal {
+            if modal {
+                node.set_modal();
+            }
+        }
+        if let Some(controls) = &self.aria.controls {
+            node.set_controls(controls.clone());
+        }
+        if let Some(labelled_by) = &self.aria.labelled_by {
+            node.set_labelled_by(labelled_by.clone());
+        }
+        if let Some(described_by) = &self.aria.described_by {
+            node.set_described_by(described_by.clone());
+        }
+        if let Some(multiselectable) = self.aria.multiselectable {
+            if multiselectable {
+                node.set_multiselectable();
+            }
+        }
+        if let Some(live) = self.aria.live {
+            node.set_live(live);
+        }
+        if let Some(live_atomic) = self.aria.live_atomic {
+            if live_atomic {
+                node.set_live_atomic();
+            }
+        }
+        if let Some(required) = self.aria.required {
+            if required {
+                node.set_required();
+            }
+        }
+        if let Some(invalid) = self.aria.invalid {
+            node.set_invalid(invalid);
+        }
+        if let Some(error_message) = self.aria.error_message {
+            node.set_error_message(error_message);
+        }
+        if let Some(busy) = self.aria.busy {
+            if busy {
+                node.set_busy();
+            }
+        }
+        if let Some(current) = self.aria.current {
+            node.set_aria_current(current);
         }
         if let Some(toggled) = self.aria.toggled {
             node.set_toggled(toggled);
@@ -4110,6 +4305,10 @@ where
 
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
         self.element.write_a11y_info(node);
+    }
+
+    fn a11y_node_id(&self, global_id: &GlobalElementId) -> accesskit::NodeId {
+        self.element.a11y_node_id(global_id)
     }
 
     fn a11y_synthetic_children(
@@ -5256,6 +5455,65 @@ mod tests {
         element.interactivity().write_a11y_info(&mut node);
 
         assert_eq!(node.author_id(), Some("settings.buffer-font-size"));
+    }
+
+    #[test]
+    fn accessibility_metadata_builders_write_native_accesskit_properties() {
+        let popup = accesskit::NodeId(41);
+        let label = accesskit::NodeId(42);
+        let description = accesskit::NodeId(43);
+        let error = accesskit::NodeId(44);
+        let mut element = div()
+            .id("control")
+            .accessibility_node_id(accesskit::NodeId(40))
+            .aria_has_popup(accesskit::HasPopup::Dialog)
+            .aria_modal(true)
+            .aria_controls([popup, popup])
+            .aria_labelled_by([label])
+            .aria_described_by([description])
+            .aria_multiselectable(true)
+            .aria_live(accesskit::Live::Assertive)
+            .aria_live_atomic(true)
+            .aria_required(true)
+            .aria_invalid(accesskit::Invalid::True)
+            .aria_error_message(error)
+            .aria_busy(true)
+            .aria_current(accesskit::AriaCurrent::Page);
+        let mut node = accesskit::Node::new(accesskit::Role::Button);
+
+        element.interactivity().write_a11y_info(&mut node);
+
+        assert_eq!(node.has_popup(), Some(accesskit::HasPopup::Dialog));
+        assert!(node.is_modal());
+        assert_eq!(node.controls(), &[popup]);
+        assert_eq!(node.labelled_by(), &[label]);
+        assert_eq!(node.described_by(), &[description]);
+        assert!(node.is_multiselectable());
+        assert_eq!(node.live(), Some(accesskit::Live::Assertive));
+        assert!(node.is_live_atomic());
+        assert!(node.is_required());
+        assert_eq!(node.invalid(), Some(accesskit::Invalid::True));
+        assert_eq!(node.error_message(), Some(error));
+        assert!(node.is_busy());
+        assert_eq!(node.aria_current(), Some(accesskit::AriaCurrent::Page));
+    }
+
+    #[test]
+    fn explicit_accessibility_node_id_survives_visual_reparenting() {
+        let stable = accesskit::NodeId(99);
+        let element = div().id("popup").accessibility_node_id(stable);
+        let ordinary_path = GlobalElementId(Arc::from([
+            ElementId::Name("view".into()),
+            ElementId::Name("popup".into()),
+        ]));
+        let deferred_path = GlobalElementId(Arc::from([
+            ElementId::Name("view".into()),
+            ElementId::Name("overlay".into()),
+            ElementId::Name("popup".into()),
+        ]));
+
+        assert_eq!(element.a11y_node_id(&ordinary_path), stable);
+        assert_eq!(element.a11y_node_id(&deferred_path), stable);
     }
 
     #[test]

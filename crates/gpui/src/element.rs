@@ -119,6 +119,14 @@ pub trait Element: 'static + IntoElement {
     /// See the [accessibility guide](crate::_accessibility) for an overview.
     fn write_a11y_info(&self, _node: &mut accesskit::Node) {}
 
+    /// Select the AccessKit node ID used for this element.
+    ///
+    /// The default is derived from the global element path. An element may
+    /// override it when accessibility identity must survive visual reparenting.
+    fn a11y_node_id(&self, global_id: &GlobalElementId) -> accesskit::NodeId {
+        global_id.accesskit_node_id()
+    }
+
     /// Add synthetic child nodes to an [`Element`] that has an
     /// [`.id()`][Element::id] and a [`.role()`][Element::a11y_role].
     ///
@@ -225,7 +233,12 @@ impl Display for GlobalElementId {
 }
 
 impl GlobalElementId {
-    pub(crate) fn accesskit_node_id(&self) -> accesskit::NodeId {
+    /// Return the stable AccessKit node ID derived from this element path.
+    ///
+    /// Relationship builders may use this while source and target remain under
+    /// the same global element paths. Content that moves into a deferred layer
+    /// should use `StatefulInteractiveElement::accessibility_node_id` instead.
+    pub fn accesskit_node_id(&self) -> accesskit::NodeId {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::default();
         self.hash(&mut hasher);
@@ -366,7 +379,7 @@ impl<E: Element> Drawable<E> {
                 if window.a11y.is_active() {
                     if let Some(global_id) = global_id.as_ref() {
                         if let Some(role) = self.element.a11y_role() {
-                            let node_id = global_id.accesskit_node_id();
+                            let node_id = self.element.a11y_node_id(global_id);
                             let mut node = accesskit::Node::new(role);
                             let scale = window.scale_factor();
                             node.set_bounds(accesskit::Rect {
@@ -424,7 +437,7 @@ impl<E: Element> Drawable<E> {
                             source_location: self.element.source_location(),
                         };
                         let mut builder = A11ySubtreeBuilder::new(
-                            global_id.accesskit_node_id(),
+                            self.element.a11y_node_id(global_id),
                             &mut window.a11y.nodes,
                         );
                         #[cfg(debug_assertions)]
