@@ -1408,6 +1408,12 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set whether this element is unavailable for interaction.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = Some(disabled);
+        self
+    }
+
     /// Set the expanded state for this element.
     fn aria_expanded(mut self, expanded: bool) -> Self {
         self.interactivity().aria.expanded = Some(expanded);
@@ -2223,6 +2229,7 @@ pub(crate) struct AriaProperties {
     pub(crate) description: Option<SharedString>,
     pub(crate) keyshortcuts: Option<SharedString>,
     pub(crate) selected: Option<bool>,
+    pub(crate) disabled: Option<bool>,
     pub(crate) expanded: Option<bool>,
     pub(crate) has_popup: Option<accesskit::HasPopup>,
     pub(crate) modal: Option<bool>,
@@ -3694,6 +3701,11 @@ impl Interactivity {
         }
         if let Some(selected) = self.aria.selected {
             node.set_selected(selected);
+        }
+        if let Some(disabled) = self.aria.disabled {
+            if disabled {
+                node.set_disabled();
+            }
         }
         if let Some(expanded) = self.aria.expanded {
             node.set_expanded(expanded);
@@ -5482,6 +5494,7 @@ mod tests {
             .id("control")
             .accessibility_node_id(accesskit::NodeId(40))
             .aria_has_popup(accesskit::HasPopup::Dialog)
+            .aria_disabled(true)
             .aria_modal(true)
             .aria_hidden(true)
             .aria_controls([popup, popup])
@@ -5500,6 +5513,7 @@ mod tests {
         element.interactivity().write_a11y_info(&mut node);
 
         assert_eq!(node.has_popup(), Some(accesskit::HasPopup::Dialog));
+        assert!(node.is_disabled());
         assert!(node.is_modal());
         assert!(node.is_hidden());
         assert_eq!(node.controls(), &[popup]);
