@@ -1426,6 +1426,15 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Hide this element and its subtree from the accessibility tree.
+    ///
+    /// This does not affect layout, painting, hit testing, or keyboard focus. Consumers that
+    /// implement modal inertness must suppress those interaction paths separately.
+    fn aria_hidden(mut self, hidden: bool) -> Self {
+        self.interactivity().aria.hidden = Some(hidden);
+        self
+    }
+
     /// Identify nodes controlled by this element.
     ///
     /// AccessKit adapters derive the reverse controlled-by relationship from
@@ -2217,6 +2226,7 @@ pub(crate) struct AriaProperties {
     pub(crate) expanded: Option<bool>,
     pub(crate) has_popup: Option<accesskit::HasPopup>,
     pub(crate) modal: Option<bool>,
+    pub(crate) hidden: Option<bool>,
     pub(crate) controls: Option<Vec<accesskit::NodeId>>,
     pub(crate) labelled_by: Option<Vec<accesskit::NodeId>>,
     pub(crate) described_by: Option<Vec<accesskit::NodeId>>,
@@ -3694,6 +3704,11 @@ impl Interactivity {
         if let Some(modal) = self.aria.modal {
             if modal {
                 node.set_modal();
+            }
+        }
+        if let Some(hidden) = self.aria.hidden {
+            if hidden {
+                node.set_hidden();
             }
         }
         if let Some(controls) = &self.aria.controls {
@@ -5468,6 +5483,7 @@ mod tests {
             .accessibility_node_id(accesskit::NodeId(40))
             .aria_has_popup(accesskit::HasPopup::Dialog)
             .aria_modal(true)
+            .aria_hidden(true)
             .aria_controls([popup, popup])
             .aria_labelled_by([label])
             .aria_described_by([description])
@@ -5485,6 +5501,7 @@ mod tests {
 
         assert_eq!(node.has_popup(), Some(accesskit::HasPopup::Dialog));
         assert!(node.is_modal());
+        assert!(node.is_hidden());
         assert_eq!(node.controls(), &[popup]);
         assert_eq!(node.labelled_by(), &[label]);
         assert_eq!(node.described_by(), &[description]);
