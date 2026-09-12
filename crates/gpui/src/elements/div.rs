@@ -1432,6 +1432,12 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set the kind of autocomplete behavior exposed by this editable control.
+    fn aria_auto_complete(mut self, auto_complete: accesskit::AutoComplete) -> Self {
+        self.interactivity().aria.auto_complete = Some(auto_complete);
+        self
+    }
+
     /// Mark this element as modal or non-modal.
     fn aria_modal(mut self, modal: bool) -> Self {
         self.interactivity().aria.modal = Some(modal);
@@ -2239,6 +2245,7 @@ pub(crate) struct AriaProperties {
     pub(crate) read_only: Option<bool>,
     pub(crate) expanded: Option<bool>,
     pub(crate) has_popup: Option<accesskit::HasPopup>,
+    pub(crate) auto_complete: Option<accesskit::AutoComplete>,
     pub(crate) modal: Option<bool>,
     pub(crate) hidden: Option<bool>,
     pub(crate) controls: Option<Vec<accesskit::NodeId>>,
@@ -3724,6 +3731,9 @@ impl Interactivity {
         }
         if let Some(has_popup) = self.aria.has_popup {
             node.set_has_popup(has_popup);
+        }
+        if let Some(auto_complete) = self.aria.auto_complete {
+            node.set_auto_complete(auto_complete);
         }
         if let Some(modal) = self.aria.modal {
             if modal {
@@ -5506,6 +5516,7 @@ mod tests {
             .id("control")
             .accessibility_node_id(accesskit::NodeId(40))
             .aria_has_popup(accesskit::HasPopup::Dialog)
+            .aria_auto_complete(accesskit::AutoComplete::Both)
             .aria_disabled(true)
             .aria_read_only(true)
             .aria_modal(true)
@@ -5526,6 +5537,7 @@ mod tests {
         element.interactivity().write_a11y_info(&mut node);
 
         assert_eq!(node.has_popup(), Some(accesskit::HasPopup::Dialog));
+        assert_eq!(node.auto_complete(), Some(accesskit::AutoComplete::Both));
         assert!(node.is_disabled());
         assert!(node.is_read_only());
         assert!(node.is_modal());
